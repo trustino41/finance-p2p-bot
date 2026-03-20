@@ -12,13 +12,15 @@ WEBHOOK_URL = "https://finance-p2p-bot-1.onrender.com"
 # رابط صورة التنبيه (USDT أو Binance)
 IMAGE_URL = "https://raw.githubusercontent.com/binance/brand-assets/master/logo/vertical/black.png"
 
+
 current_amount = "200000"
 last_data_hash = ""
 last_alert_hash = ""
+
 show_price_filter = 0.0
 alert_price = 0.0
 
-# --- 2. KEYBOARD & HELPERS ---
+
 def get_keyboard():
     return InlineKeyboardMarkup([
         [
@@ -29,121 +31,294 @@ def get_keyboard():
         [InlineKeyboardButton("🔄 Actualiser", callback_data="refresh")]
     ])
 
-def is_blocked_payment(ad):
-    blocked = ["airtime", "orange", "flexy", "ooredoo", "mobilis"]
-    methods = ad.get("adv", {}).get("tradeMethods", [])
+
+def norm(x):
+    return str(x).strip().lower() if x else ""
+
+
+def format_number(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def extract_payment_names(ad):
+    names = []
+    adv = ad.get("adv", {})
+
+    methods = adv.get("tradeMethods", [])
     for m in methods:
-        name = str(m.get("tradeMethodName", "")).lower()
-        if any(b in name for b in blocked): return True
+        if isinstance(m, dict):
+            for k in ("tradeMethodName", "identifier", "payType", "payMethodName"):
+                if m.get(k):
+                    names.append(str(m.get(k)))
+
+    for p in adv.get("payTypes", []):
+        if p:
+            names.append(str(p))
+
+    unique = []
+    for n in names:
+        if n not in unique:
+            unique.append(n)
+
+    return unique
+
+
+def is_blocked_payment(ad):
+    blocked = ["airtime", "orange"]
+    for name in extract_payment_names(ad):
+        t = norm(name)
+        if any(b in t for b in blocked):
+            return True
     return False
 
+
 def build_message(adverts):
-    msg = f"📊 *Recherche: {int(current_amount):,} DZD*\n"
+    msg = f"📊 Recherche pour un montant de : DZD {int(current_amount):,}\n"
+
     if show_price_filter > 0:
-        msg += f"💹 *Filtre: >= {show_price_filter}*\n"
+        msg += f"💹 Afficher les acheteurs à partir de : ⁠ {format_number(show_price_filter)} ⁠ et plus\n"
+    else:
+        msg += "💹 Afficher tous les prix\n"
+
     if alert_price > 0:
-        msg += f"🚨 *Alerte à: {alert_price}*\n"
+        msg += f"🚨 Prix d'alerte : ⁠ {format_number(alert_price)} ⁠\n"
+
     msg += "\n"
+
     for i, ad in enumerate(adverts[:5], start=1):
-        price = ad["adv"]["price"]
-        name = ad["advertiser"]["nickName"]
-        msg += f"{i}️⃣ *{price} DZD* | 👤 `{name}`\n"
+        adv = ad.get("adv", {})
+        user = ad.get("advertiser", {})
+
+        price = adv.get("price", "0")
+        name = user.get("nickName", "Inconnu")
+        rate = user.get("positiveRate", 0)
+
+        try:
+            rate = float(rate)
+        except Exception:
+            rate = 0.0
+
+        if rate <= 1:
+            rate *= 100
+
+        min_l = adv.get("minSingleTransAmount", "0")
+        max_l = adv.get("dynamicMaxSingleTransAmount", adv.get("maxSingleTransAmount", "0"))
+
+        msg += (
+            f"{i}️⃣ {price} DZD\n"
+            f"👤 ⁠ {name} ⁠ | 👍 ⁠ {rate:.2f}% ⁠\n"
+            f"💰 ⁠ {min_l} ⁠ - ⁠ {max_l} ⁠\n\n"
+        )
+
     return msg
 
-# --- 3. CORE LOGIC (FETCH & NOTIFY) ---
+
 async def fetch_p2p(context: ContextTypes.DEFAULT_TYPE):
     global last_data_hash, last_alert_hash
+
     url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
     payload = {
-        "asset": "USDT", "fiat": "DZD", "merchantCheck": False,
-        "page": 1, "rows": 10, "tradeType": "SELL", "transAmount": current_amount
+        "asset": "USDT",
+        "fiat": "DZD",
+        "merchantCheck": False,
+        "page": 1,
+        "rows": 10,
+        "tradeType": "SELL",
+        "transAmount": current_amount
     }
+    headers = {"User-Agent": "Mozilla/5.0"}
+
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            res = await client.post(url, json=payload)
-            data = res.json()
-        
-        adverts = [a for a in data.get("data", []) if not is_blocked_payment(a)]
-        
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+
+        adverts = data.get("data", [])
+        adverts = [a for a in adverts if not is_blocked_payment(a)]
+
         if show_price_filter > 0:
-            adverts = [a for a in adverts if float(a["adv"]["price"]) >= show_price_filter]
+            filtered = []
+            for a in adverts:
+                try:
+                    price = float(a["adv"]["price"])
+                    if price >= show_price_filter:
+                        filtered.append(a)
+                except Exception:
+                    pass
+            adverts = filtered
 
-        if not adverts: return
+        if not adverts:
+            text = "⚠️ Aucun acheteur ne correspond aux paramètres actuels."
+            current_hash = hashlib.md5(text.encode()).hexdigest()
 
-        status = "".join(f"{a['adv']['price']}" for a in adverts[:3])
+            if current_hash != last_data_hash:
+                last_data_hash = current_hash
+                await context.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=text,
+                    reply_markup=get_keyboard()
+                )
+            return
+
+        try:
+            adverts.sort(key=lambda a: float(a["adv"]["price"]), reverse=True)
+        except Exception:
+            pass
+
+        status = "".join(
+            f"{a['adv'].get('price', '')}{a['advertiser'].get('nickName', '')}"
+            for a in adverts[:5]
+        )
         current_hash = hashlib.md5(status.encode()).hexdigest()
+
+        top_price = 0.0
+        top_name = ""
+        try:
+            top_price = float(adverts[0]["adv"]["price"])
+            top_name = adverts[0]["advertiser"].get("nickName", "")
+        except Exception:
+            pass
 
         if current_hash != last_data_hash:
             last_data_hash = current_hash
             msg = build_message(adverts)
-            # إرسال الصورة مع التحديث
-            await context.bot.send_photo(
+
+            await context.bot.send_message(
                 chat_id=CHAT_ID,
-                photo=IMAGE_URL,
-                caption=msg,
+                text=msg,
                 parse_mode="Markdown",
                 reply_markup=get_keyboard()
             )
 
-        # منطق التنبيه الخاص (Alert)
-        top_price = float(adverts[0]["adv"]["price"])
         if alert_price > 0 and top_price >= alert_price:
-            alert_key = f"alert-{top_price}"
-            if hashlib.md5(alert_key.encode()).hexdigest() != last_alert_hash:
-                last_alert_hash = hashlib.md5(alert_key.encode()).hexdigest()
-                await context.bot.send_message(CHAT_ID, f"🚨 *ALERTE P2P!*\nLe prix a atteint `{top_price} DZD`", parse_mode="Markdown")
+            alert_key = f"{top_price}-{top_name}"
+            current_alert_hash = hashlib.md5(alert_key.encode()).hexdigest()
 
-    except Exception as e: print(f"Error: {e}")
+            if current_alert_hash != last_alert_hash:
+                last_alert_hash = current_alert_hash
+                await context.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(
+                        f"🚨 Alerte de prix\n\n"
+                        f"Un acheteur a atteint le prix d'alerte ou plus.\n\n"
+                        f"💵 Prix : ⁠ {format_number(top_price)} DZD ⁠\n"
+                        f"👤 Nom : ⁠ {top_name} ⁠"
+                    ),
+                    parse_mode="Markdown"
+                )
 
-# --- 4. HANDLERS ---
+    except Exception as e:
+        print("ERROR:", e)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_amount, show_price_filter, alert_price, last_data_hash
-    text = update.message.text.strip()
-    
+    global current_amount, last_data_hash, last_alert_hash
+    global show_price_filter, alert_price
+
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip().replace(",", ".")
+
     if text == "0":
         show_price_filter = 0.0
         alert_price = 0.0
-        await update.message.reply_text("✅ Filtres réinitialisés.")
-    elif text.isdigit() and int(text) > 1000:
+        last_data_hash = ""
+        last_alert_hash = ""
+
+        await update.message.reply_text("✅ Le prix d'affichage et le prix d'alerte ont été réinitialisés.")
+        await fetch_p2p(context)
+        return
+
+    try:
+        value = float(text)
+
+        if 0 < value < 1000:
+            if show_price_filter == 0:
+                show_price_filter = value
+                last_data_hash = ""
+                last_alert_hash = ""
+                await update.message.reply_text(
+                    f"✅ Prix minimum d'affichage mis à jour à : {format_number(show_price_filter)} et plus"
+                )
+                await fetch_p2p(context)
+                return
+
+            if value >= show_price_filter:
+                alert_price = value
+                last_alert_hash = ""
+                await update.message.reply_text(
+                    f"🚨 Prix d'alerte mis à jour à : {format_number(alert_price)}"
+                )
+                await fetch_p2p(context)
+                return
+
+            show_price_filter = value
+            if alert_price > 0 and alert_price < show_price_filter:
+                alert_price = 0.0
+
+            last_data_hash = ""
+            last_alert_hash = ""
+            await update.message.reply_text(
+                f"✅ Prix minimum d'affichage mis à jour à : {format_number(show_price_filter)} et plus"
+            )
+            await fetch_p2p(context)
+            return
+
+    except Exception:
+        pass
+
+    if text.isdigit():
         current_amount = text
-        await update.message.reply_text(f"⚙️ Montant changé à {text} DZD")
-    else:
-        try:
-            val = float(text)
-            if show_price_filter == 0: show_price_filter = val
-            else: alert_price = val
-            await update.message.reply_text(f"✅ Paramètres mis à jour.")
-        except: pass
-    
-    last_data_hash = ""
-    await fetch_p2p(context)
+        last_data_hash = ""
+
+        await update.message.reply_text(
+            f"⚙️ Montant de recherche changé à {int(text):,} DZD"
+        )
+        await fetch_p2p(context)
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_amount, last_data_hash
+
     query = update.callback_query
+    if not query:
+        return
+
     await query.answer()
-    if "amt_" in query.data:
+
+    if query.data.startswith("amt_"):
         current_amount = query.data.split("_")[1]
+
     last_data_hash = ""
     await fetch_p2p(context)
 
-# --- 5. DEPLOYMENT (RENDER WEBHOOK) ---
+
+async def scan_callback(context: ContextTypes.DEFAULT_TYPE):
+    await fetch_p2p(context)
+
+
 def main():
-    PORT = int(os.environ.get("PORT", 8443))
+    print("Bot started on Render...")
+
     app = Application.builder().token(TOKEN).build()
-    
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_handler))
-    
+
     if app.job_queue:
-        app.job_queue.run_repeating(fetch_p2p, interval=60, first=5)
+        app.job_queue.run_repeating(scan_callback, interval=08, first=3)
+
+    port = int(os.environ.get("PORT", 10000))
 
     app.run_webhook(
         listen="0.0.0.0",
-        port=PORT,
+        port=port,
         url_path=TOKEN,
-        webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
+        webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
     )
 
-if __name__ == "__main__":
+
+if _name_ == "_main_":
     main()
