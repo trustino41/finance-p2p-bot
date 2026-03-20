@@ -308,7 +308,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
 
     if app.job_queue:
-        app.job_queue.run_repeating(scan_callback, interval=08, first=3)
+        app.job_queue.run_repeating(scan_callback, interval=8, first=3)
 
     port = int(os.environ.get("PORT", 10000))
 
