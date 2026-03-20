@@ -8,7 +8,7 @@ from telegram.ext import Application, CallbackQueryHandler, MessageHandler, Cont
 # --- 1. CONFIGURATION ---
 TOKEN = "8684970540:AAFCvC0OknPVCsszBI6CxnJM8n9LxmHqQwI"
 CHAT_ID = "7311646141"
-WEBHOOK_URL =  "https://github.com/trustino41/finance-p2p-bot.git"
+WEBHOOK_URL = "https://finance-p2p-bot-1.onrender.com"
 # رابط صورة التنبيه (USDT أو Binance)
 IMAGE_URL = "https://raw.githubusercontent.com/binance/brand-assets/master/logo/vertical/black.png"
 
